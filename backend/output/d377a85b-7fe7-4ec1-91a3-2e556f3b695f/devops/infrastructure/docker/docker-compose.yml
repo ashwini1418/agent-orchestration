@@ -1,0 +1,215 @@
+# ─── TaskFlow Local Development Stack ────────────────────────────────────────
+# Start everything with: docker-compose up
+# Starts: PostgreSQL, Redis, MinIO, MailHog, Backend, Frontend, Nginx
+#
+# Prerequisites: Docker Desktop >= 4.x, docker-compose v2
+
+version: "3.9"
+
+name: taskflow
+
+services:
+  # ─── Infrastructure ─────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16.6-alpine
+    container_name: taskflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskflow_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-taskflow_dev}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts/postgres:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-taskflow} -d ${POSTGRES_DB:-taskflow_dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - taskflow-network
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: taskflow-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-taskflow_redis_password}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-taskflow_redis_password}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - taskflow-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: taskflow-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-taskflow_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-taskflow_minio_secret}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO Console UI
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - taskflow-network
+
+  # MailHog — local SMTP + web UI for email testing
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: taskflow-mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI — http://localhost:8025
+    networks:
+      - taskflow-network
+
+  # ─── Application ────────────────────────────────────────────────────────
+
+  backend:
+    build:
+      context: ../..
+      dockerfile: apps/backend/Dockerfile
+      target: builder   # Use builder stage in dev (includes devDeps + tsx)
+    container_name: taskflow-backend
+    restart: unless-stopped
+    # Override CMD for development — hot reload with tsx watch
+    command: ["pnpm", "--filter", "@taskflow/backend", "dev"]
+    environment:
+      NODE_ENV: development
+      PORT: 4000
+
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-taskflow}:${POSTGRES_PASSWORD:-taskflow_dev_password}@postgres:5432/${POSTGRES_DB:-taskflow_dev}
+
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-taskflow_redis_password}@redis:6379
+
+      # JWT — use secrets from .env, never hardcode
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET is required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+
+      # Email — MailHog in dev
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_USER: ""
+      SMTP_PASS: ""
+      EMAIL_FROM: "TaskFlow Dev <noreply@taskflow.local>"
+
+      # S3 / MinIO
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-taskflow-uploads}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-taskflow_minio}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-taskflow_minio_secret}
+      S3_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: "true"
+
+      # OAuth (optional in dev — set in .env)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+
+      # OpenAI (optional in dev)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+      # App URLs
+      FRONTEND_URL: http://localhost:3000
+      BACKEND_URL: http://localhost:4000
+
+      # Misc
+      LOG_LEVEL: debug
+    ports:
+      - "4000:4000"
+    volumes:
+      # Mount source for hot reload
+      - ../../apps/backend/src:/app/apps/backend/src
+      - ../../packages/shared/src:/app/packages/shared/src
+      # Prevent host node_modules from overwriting container's
+      - /app/node_modules
+      - /app/apps/backend/node_modules
+      - /app/packages/shared/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - taskflow-network
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: apps/frontend/Dockerfile
+      target: builder   # builder stage for dev
+    container_name: taskflow-frontend
+    restart: unless-stopped
+    command: ["pnpm", "--filter", "@taskflow/frontend", "dev", "--host", "0.0.0.0"]
+    environment:
+      NODE_ENV: development
+      VITE_API_URL: http://localhost:4000/api
+      VITE_SOCKET_URL: http://localhost:4000
+      VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../../apps/frontend/src:/app/apps/frontend/src
+      - ../../apps/frontend/public:/app/apps/frontend/public
+      - ../../packages/shared/src:/app/packages/shared/src
+      - /app/node_modules
+      - /app/apps/frontend/node_modules
+      - /app/packages/shared/node_modules
+    depends_on:
+      - backend
+    networks:
+      - taskflow-network
+
+# ─── Volumes ────────────────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+# ─── Networks ───────────────────────────────────────────────────────────────
+
+networks:
+  taskflow-network:
+    driver: bridge
+    name: taskflow-network

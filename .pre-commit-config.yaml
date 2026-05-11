@@ -1,0 +1,29 @@
+# DEVOPS_AGENT | 2026-05-10 | Pre-commit hooks for code quality
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.8
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^backend/
+      - id: ruff-format
+        files: ^backend/
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy type check
+        entry: bash -c 'cd backend && mypy app/ --ignore-missing-imports'
+        language: system
+        files: ^backend/app/.*\.py$
+        pass_filenames: false

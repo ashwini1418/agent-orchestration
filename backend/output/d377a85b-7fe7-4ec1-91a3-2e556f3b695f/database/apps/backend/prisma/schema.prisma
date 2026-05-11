@@ -1,0 +1,371 @@
+// prisma/schema.prisma
+// TaskFlow — PostgreSQL 16 + Prisma 6.x
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── ENUMS ───────────────────────────────────────────────────────────────────
+
+enum Priority {
+  NONE
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  COMPLETED
+  ARCHIVED
+  CANCELLED
+}
+
+enum NotificationType {
+  TASK_DUE_SOON
+  TASK_OVERDUE
+  TASK_ASSIGNED
+  REMINDER
+  SYSTEM
+  DAILY_DIGEST
+}
+
+enum OAuthProvider {
+  GOOGLE
+  GITHUB
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum AuditAction {
+  CREATED
+  UPDATED
+  DELETED
+  RESTORED
+  STATUS_CHANGED
+  PRIORITY_CHANGED
+  ASSIGNED
+  COMPLETED
+  ARCHIVED
+}
+
+// ─── USER ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id                   String    @id @default(cuid())
+  email                String    @unique
+  username             String    @unique
+  passwordHash         String?   // null for OAuth-only users
+  role                 Role      @default(USER)
+  isEmailVerified      Boolean   @default(false)
+  emailVerifyToken     String?
+  emailVerifyExpiry    DateTime?
+  passwordResetToken   String?
+  passwordResetExpiry  DateTime?
+  twoFactorSecret      String?
+  twoFactorEnabled     Boolean   @default(false)
+  refreshTokens        String[]  // Array of valid refresh token hashes
+  lastLoginAt          DateTime?
+  isActive             Boolean   @default(true)
+  deletedAt            DateTime? // Soft delete
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  // Relations
+  profile              UserProfile?
+  tasks                Task[]
+  categories           Category[]
+  tags                 Tag[]
+  notifications        Notification[]
+  notificationPrefs    NotificationPreference[]
+  oauthAccounts        OAuthAccount[]
+  comments             Comment[]
+  auditLogs            AuditLog[]
+
+  @@index([email])
+  @@index([username])
+  @@index([isActive])
+  @@index([createdAt])
+  @@map("users")
+}
+
+model UserProfile {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  displayName      String
+  avatarUrl        String?
+  bio              String?
+  timezone         String   @default("UTC")
+  theme            String   @default("system") // "light" | "dark" | "system"
+  language         String   @default("en")
+  defaultView      String   @default("list")   // "list" | "kanban" | "calendar"
+  notifyEmail      Boolean  @default(true)
+  notifyPush       Boolean  @default(false)
+  dailyDigestTime  String   @default("08:00")  // HH:MM in user's timezone
+  weekStartsOn     Int      @default(0)        // 0 = Sunday, 1 = Monday
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+model OAuthAccount {
+  id             String        @id @default(cuid())
+  userId         String
+  provider       OAuthProvider
+  providerUserId String
+  accessToken    String?
+  refreshToken   String?
+  expiresAt      DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+  @@map("oauth_accounts")
+}
+
+// ─── CATEGORY ─────────────────────────────────────────────────────────────────
+
+model Category {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  color       String   @default("#6366f1") // hex color
+  icon        String?  // emoji or icon name
+  sortOrder   Int      @default(0)
+  isDefault   Boolean  @default(false)
+  isDeleted   Boolean  @default(false)
+  deletedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks       Task[]
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@index([userId, isDeleted])
+  @@index([sortOrder])
+  @@map("categories")
+}
+
+// ─── TAG ──────────────────────────────────────────────────────────────────────
+
+model Tag {
+  id        String    @id @default(cuid())
+  userId    String
+  name      String
+  color     String    @default("#94a3b8")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  taskTags  TaskTag[]
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("tags")
+}
+
+// ─── TASK ─────────────────────────────────────────────────────────────────────
+
+model Task {
+  id                String     @id @default(cuid())
+  userId            String
+  categoryId        String?
+  parentTaskId      String?    // For subtasks
+  title             String     @db.VarChar(500)
+  description       String?    @db.Text
+  priority          Priority   @default(NONE)
+  status            TaskStatus @default(TODO)
+  dueDate           DateTime?
+  reminderAt        DateTime?
+  completedAt       DateTime?
+  estimatedMinutes  Int?       // Estimated time to complete
+  actualMinutes     Int?       // Actual time spent
+  sortOrder         Int        @default(0)
+  isDeleted         Boolean    @default(false)
+  deletedAt         DateTime?
+  // Full-text search vector (populated via trigger)
+  searchVector      Unsupported("tsvector")?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  // Relations
+  user              User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category          Category?  @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  parentTask        Task?      @relation("TaskSubtasks", fields: [parentTaskId], references: [id], onDelete: Cascade)
+  subtasks          Task[]     @relation("TaskSubtasks")
+  tags              TaskTag[]
+  attachments       Attachment[]
+  comments          Comment[]
+  auditLogs         AuditLog[]
+  notifications     Notification[]
+
+  @@index([userId])
+  @@index([userId, status])
+  @@index([userId, isDeleted])
+  @@index([userId, priority])
+  @@index([userId, dueDate])
+  @@index([userId, categoryId])
+  @@index([userId, status, isDeleted])
+  @@index([userId, dueDate, isDeleted])
+  @@index([parentTaskId])
+  @@index([completedAt])
+  @@index([createdAt])
+  @@index([sortOrder])
+  // Partial index for active tasks — defined in migration SQL
+  @@map("tasks")
+}
+
+// ─── TASK TAG (Join Table) ────────────────────────────────────────────────────
+
+model TaskTag {
+  taskId    String
+  tagId     String
+  createdAt DateTime @default(now())
+
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  tag       Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, tagId])
+  @@index([tagId])
+  @@index([taskId])
+  @@map("task_tags")
+}
+
+// ─── ATTACHMENT ───────────────────────────────────────────────────────────────
+
+model Attachment {
+  id           String   @id @default(cuid())
+  taskId       String
+  userId       String
+  filename     String   // Original filename
+  storedName   String   // UUID-based stored filename
+  mimeType     String
+  sizeBytes    Int
+  storageKey   String   // S3 key or MinIO path
+  url          String?  // Public URL (presigned or CDN)
+  isDeleted    Boolean  @default(false)
+  deletedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  task         Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@index([userId])
+  @@map("attachments")
+}
+
+// ─── COMMENT ──────────────────────────────────────────────────────────────────
+
+model Comment {
+  id        String    @id @default(cuid())
+  taskId    String
+  userId    String
+  content   String    @db.Text
+  isEdited  Boolean   @default(false)
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+  editedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@index([userId])
+  @@index([taskId, isDeleted])
+  @@map("comments")
+}
+
+// ─── NOTIFICATION ─────────────────────────────────────────────────────────────
+
+model Notification {
+  id         String           @id @default(cuid())
+  userId     String
+  taskId     String?
+  type       NotificationType
+  title      String
+  body       String
+  isRead     Boolean          @default(false)
+  readAt     DateTime?
+  scheduledFor DateTime?      // For future notifications
+  sentAt     DateTime?
+  metadata   Json?            // Extra data (task title, etc.)
+  createdAt  DateTime         @default(now())
+
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task       Task?            @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+  @@index([scheduledFor])
+  @@index([taskId])
+  @@map("notifications")
+}
+
+// ─── NOTIFICATION PREFERENCE ──────────────────────────────────────────────────
+
+model NotificationPreference {
+  id               String           @id @default(cuid())
+  userId           String
+  type             NotificationType
+  emailEnabled     Boolean          @default(true)
+  pushEnabled      Boolean          @default(false)
+  inAppEnabled     Boolean          @default(true)
+  advanceMinutes   Int              @default(30) // How many minutes before to notify
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  user             User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, type])
+  @@index([userId])
+  @@map("notification_preferences")
+}
+
+// ─── AUDIT LOG ────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String      @id @default(cuid())
+  userId     String
+  taskId     String?
+  action     AuditAction
+  entityType String      // "task" | "category" | "comment" etc.
+  entityId   String
+  oldValues  Json?       // Previous state snapshot
+  newValues  Json?       // New state snapshot
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime    @default(now())
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task       Task?       @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([taskId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@map("audit_logs")
+}

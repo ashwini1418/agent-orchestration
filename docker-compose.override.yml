@@ -1,0 +1,33 @@
+# DEVOPS_AGENT | 2026-05-10 | Dev overrides - hot reload, SQLite, no nginx
+version: "3.9"
+
+services:
+  # Remove postgres in dev - SQLite used instead
+  postgres:
+    profiles: ["disabled"]
+
+  backend:
+    build:
+      context: ./backend
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/data:/app/data
+      - ./output:/app/output
+      - ./keys:/app/keys
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:///./data/dev.db
+      DEBUG: "true"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    depends_on: {}
+
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
